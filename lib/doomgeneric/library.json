@@ -1,0 +1,30 @@
+{
+  "name": "doomgeneric",
+  "version": "1.0.0",
+  "description": "ozkl/doomgeneric, vendored for the UNIHIKER K10. Platform backends removed; the K10 backend lives in src/doomgeneric_k10.cpp.",
+  "build": {
+    "srcFilter": ["+<*.c>"],
+    "flags": [
+      "-DNORMALUNIX",
+      "-DLINUX",
+      "-D_DEFAULT_SOURCE",
+      "-DDOOMGENERIC_RESX=320",
+      "-DDOOMGENERIC_RESY=200",
+      "-Os",
+      "-Wno-implicit-function-declaration",
+      "-Wno-incompatible-pointer-types",
+      "-Wno-unused-variable",
+      "-Wno-unused-but-set-variable",
+      "-Wno-sign-compare",
+      "-Wno-format",
+      "-Wno-parentheses",
+      "-Wno-misleading-indentation",
+      "-Wno-char-subscripts",
+      "-Wno-array-bounds",
+      "-Wno-stringop-truncation",
+      "-Wno-stringop-overflow",
+      "-Wno-maybe-uninitialized",
+      "-Wno-return-type"
+    ]
+  }
+}

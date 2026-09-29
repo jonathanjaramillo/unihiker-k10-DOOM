@@ -1,0 +1,7 @@
+# Local controller implementation (pending replacement).
+/game_controller/
+
+# PlatformIO build output and local editor / OS files.
+/.pio/
+.DS_Store
+/.vscode/
