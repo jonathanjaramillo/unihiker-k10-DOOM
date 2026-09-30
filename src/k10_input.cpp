@@ -1,4 +1,4 @@
-// Two input producers feeding one event queue:
+// Three input producers feeding one event queue:
 //
 //   1. A keyboard over USB-CDC serial. A terminal sends no key-up events, so
 //      each press is auto-released after AUTOREPEAT_MS unless it is pressed
@@ -6,6 +6,7 @@
 //   2. The onboard buttons: A and B sit behind the XL9535 I2C expander, BOOT is
 //      a plain GPIO0. (Note: A is NOT GPIO12 -- that label in pins_arduino.h
 //      refers to the edge connector, and GPIO12 is SPI SCLK.)
+//   3. An optional I2C joystick controller at 0x5A on the shared Wire bus.
 
 #include <Arduino.h>
 #include <freertos/FreeRTOS.h>
@@ -17,6 +18,13 @@ extern "C" {
 }
 #include "k10_input.h"
 
+#ifndef K10_GAME_CONTROLLER
+#define K10_GAME_CONTROLLER 1
+#endif
+#if K10_GAME_CONTROLLER
+#include <GameController.h>
+#endif
+
 #define BOOT_GPIO      0
 #define AUTOREPEAT_MS  140
 
@@ -27,6 +35,7 @@ static bool s_pollButtonsEnabled = true;
 // BOOT (GPIO0) is also the I2S bit clock -- k10_sound.cpp disables this once
 // it owns the pin. See k10_input_set_boot_enabled().
 static bool s_bootButtonEnabled = true;
+static uint8_t s_lastA = 1, s_lastB = 1, s_lastBoot = 1;
 
 typedef struct { uint8_t pressed; uint8_t key; } KeyEvent;
 
@@ -53,16 +62,31 @@ static const char *keyName(uint8_t k)
   }
 }
 
-static void push(uint8_t pressed, uint8_t key)
+// Each producer owns its own held keys. A release from one source must not
+// cancel a key still held by another source. Queue overflow is retried on the
+// next input tick instead of losing a release and leaving a Doom key stuck.
+enum InputSource { SERIAL_INPUT, BOARD_INPUT, CONTROLLER_INPUT, INPUT_SOURCE_COUNT };
+static bool s_keys[INPUT_SOURCE_COUNT][256] = {};
+static bool s_queuedKeys[256] = {};
+
+static void setKey(InputSource source, uint8_t key, bool pressed)
 {
-  if (!s_queue) return;
-  KeyEvent e = {pressed, key};
-  if (xQueueSend(s_queue, &e, 0) != pdTRUE) {
-    if (k10_input_debug) Serial.println("[key] QUEUE FULL - event dropped");
-    return;
+  s_keys[source][key] = pressed;
+}
+
+static void flushKeys()
+{
+  for (unsigned key = 0; key < 256; ++key) {
+    bool pressed = false;
+    for (unsigned source = 0; source < INPUT_SOURCE_COUNT; ++source)
+      pressed |= s_keys[source][key];
+    if (pressed == s_queuedKeys[key]) continue;
+    KeyEvent event = {uint8_t(pressed), uint8_t(key)};
+    if (xQueueSend(s_queue, &event, 0) != pdTRUE) return;
+    s_queuedKeys[key] = pressed;
+    if (k10_input_debug)
+      Serial.printf("[key] %s 0x%02X (%s)\n", pressed ? "DOWN" : "up", key, keyName(key));
   }
-  if (k10_input_debug)
-    Serial.printf("[key] %s 0x%02X (%s)\n", pressed ? "DOWN" : "up  ", key, keyName(key));
 }
 
 // --- serial keyboard --------------------------------------------------------
@@ -81,7 +105,7 @@ static void serialPress(uint8_t key)
     if (s_held[i].key == 0) {
       s_held[i].key = key;
       s_held[i].expiry = now + AUTOREPEAT_MS;
-      push(1, key);
+      setKey(SERIAL_INPUT, key, true);
       return;
     }
   }
@@ -92,7 +116,7 @@ static void serialExpire()
   uint32_t now = millis();
   for (int i = 0; i < MAX_HELD; i++) {
     if (s_held[i].key && (int32_t)(now - s_held[i].expiry) >= 0) {
-      push(0, s_held[i].key);
+      setKey(SERIAL_INPUT, s_held[i].key, false);
       s_held[i].key = 0;
     }
   }
@@ -123,6 +147,10 @@ static uint8_t mapSerial(int c)
   }
 }
 
+#if K10_GAME_CONTROLLER
+static void dumpControllerStatus();
+#endif
+
 // Returns true if the byte was a debug command and should not reach Doom.
 static bool debugCommand(int c)
 {
@@ -133,6 +161,9 @@ static bool debugCommand(int c)
                     (unsigned long)k10_pressBoot,
                     digital_read(eP5_KeyA), digital_read(eP11_KeyB), digitalRead(BOOT_GPIO),
                     s_pollButtonsEnabled ? "on" : "off");
+#if K10_GAME_CONTROLLER
+      dumpControllerStatus();
+#endif
       return true;
     case '[':
       digital_write(eAmp_Gain, 0);
@@ -146,6 +177,10 @@ static bool debugCommand(int c)
       return true;
     case ';':
       s_pollButtonsEnabled = !s_pollButtonsEnabled;
+      if (!s_pollButtonsEnabled) {
+        memset(s_keys[BOARD_INPUT], 0, sizeof(s_keys[BOARD_INPUT]));
+        s_lastA = s_lastB = s_lastBoot = 1;
+      }
       Serial.printf("[dbg] button polling %s\n", s_pollButtonsEnabled ? "ENABLED" : "DISABLED");
       return true;
     case '=':
@@ -182,34 +217,105 @@ static void pollSerial()
 
 // --- onboard buttons --------------------------------------------------------
 
-static uint8_t s_lastA = 1, s_lastB = 1, s_lastBoot = 1;
 
 static void pollButtons()
 {
   uint8_t a = digital_read(eP5_KeyA);     // active low
   uint8_t b = digital_read(eP11_KeyB);
 
-  if (a != s_lastA) { if (!a) k10_pressA++; push(!a, KEY_FIRE); s_lastA = a; }
-  if (b != s_lastB) { if (!b) k10_pressB++; push(!b, KEY_USE);  s_lastB = b; }
+  if (a != s_lastA) { if (!a) k10_pressA++; setKey(BOARD_INPUT, KEY_FIRE, !a); s_lastA = a; }
+  if (b != s_lastB) { if (!b) k10_pressB++; setKey(BOARD_INPUT, KEY_USE, !b);  s_lastB = b; }
 
   if (!s_bootButtonEnabled) return;   // GPIO0 now belongs to I2S BCLK
 
   uint8_t boot = digitalRead(BOOT_GPIO);
-  if (boot != s_lastBoot) { if (!boot) k10_pressBoot++; push(!boot, KEY_TAB); s_lastBoot = boot; }  // TODO: weapon cycle
+  if (boot != s_lastBoot) { if (!boot) k10_pressBoot++; setKey(BOARD_INPUT, KEY_TAB, !boot); s_lastBoot = boot; }  // TODO: weapon cycle
 }
+
+// --- optional I2C controller ------------------------------------------------
+
+#if K10_GAME_CONTROLLER
+static GameController s_controller;
+static bool s_controllerOnline = false;
+static uint32_t s_controllerNextPoll = 0;
+
+static void dumpControllerStatus()
+{
+  uint8_t x, y;
+  if (s_controller.readAxes(x, y))
+    Serial.printf("[controller] 0x5A responding | X=%u Y=%u | online=%s\n",
+                  x, y, s_controllerOnline ? "yes" : "no");
+  else
+    Serial.println("[controller] no response at 0x5A");
+}
+
+// Hysteresis around the centre prevents jitter from tapping movement keys.
+static void axisKeys(uint8_t value, uint8_t negative, uint8_t positive)
+{
+  bool low = s_keys[CONTROLLER_INPUT][negative];
+  bool high = s_keys[CONTROLLER_INPUT][positive];
+  setKey(CONTROLLER_INPUT, negative, value < (low ? 104 : 88));
+  setKey(CONTROLLER_INPUT, positive, value > (high ? 152 : 168));
+}
+
+static void pollController()
+{
+  uint32_t now = millis();
+  if ((int32_t)(now - s_controllerNextPoll) < 0) return;
+
+  uint8_t x, y;
+  uint8_t events[GameController::BUTTON_COUNT];
+  bool ok = s_controller.readAxes(x, y);
+  for (uint8_t i = 0; ok && i < GameController::BUTTON_COUNT; ++i)
+    ok = s_controller.readButtonEvent((GameController::Button)i, events[i]);
+
+  if (ok != s_controllerOnline)
+    Serial.println(ok ? "[controller] connected at 0x5A" : "[controller] disconnected");
+  s_controllerOnline = ok;
+  s_controllerNextPoll = now + (ok ? 20 : 1000);
+  if (!ok) {
+    memset(s_keys[CONTROLLER_INPUT], 0, sizeof(s_keys[CONTROLLER_INPUT]));
+    return;
+  }
+
+  axisKeys(x, KEY_LEFTARROW, KEY_RIGHTARROW);
+  // The supplied controller demo treats high Y as upward movement.
+  axisKeys(y, KEY_DOWNARROW, KEY_UPARROW);
+  static const uint8_t keys[GameController::BUTTON_COUNT] = {
+    KEY_ESCAPE, KEY_USE, KEY_FIRE, KEY_TAB, KEY_ENTER
+  };
+  for (uint8_t i = 0; i < GameController::BUTTON_COUNT; ++i) {
+    switch (events[i]) {
+      case GameController::PRESS_DOWN:
+      case GameController::PRESS_REPEAT:
+      case GameController::LONG_PRESS_START:
+      case GameController::LONG_PRESS_HOLD:
+        setKey(CONTROLLER_INPUT, keys[i], true);
+        break;
+      case GameController::PRESS_UP:
+      case GameController::SINGLE_CLICK:
+      case GameController::DOUBLE_CLICK:
+      case GameController::NONE_PRESS:
+        setKey(CONTROLLER_INPUT, keys[i], false);
+        break;
+    }
+  }
+}
+#endif
 
 // --- public -----------------------------------------------------------------
 
 static void inputTask(void *)
 {
-  uint32_t lastDump = 0;
   for (;;) {
     pollSerial();
     if (s_pollButtonsEnabled) pollButtons();
 
-    // Periodic raw dump so "no button events" can be told apart from
-    // "buttons not pressed". Expect 1 when released, 0 when held.
-    (void)lastDump;
+#if K10_GAME_CONTROLLER
+    pollController();
+#endif
+    if (!s_bootButtonEnabled) setKey(BOARD_INPUT, KEY_TAB, false);
+    flushKeys();
     vTaskDelay(pdMS_TO_TICKS(10));   // 100 Hz
   }
 }
@@ -223,6 +329,20 @@ void k10_input_begin(void)
 {
   memset(s_held, 0, sizeof(s_held));
   s_queue = xQueueCreate(64, sizeof(KeyEvent));
+  if (!s_queue) {
+    Serial.println("[input] failed to allocate event queue");
+    return;
+  }
+#if K10_GAME_CONTROLLER
+  // Match the vendor K10.begin(): attach Wire after init_board(), using the
+  // board's default SDA/SCL pins, without reinitializing the board or camera.
+  if (Wire.begin()) {
+    s_controller.begin(Wire);
+    Serial.println("[controller] auto-detect enabled (0x5A)");
+  } else {
+    Serial.println("[controller] Wire initialization failed");
+  }
+#endif
   pinMode(BOOT_GPIO, INPUT_PULLUP);
   xTaskCreatePinnedToCore(inputTask, "k10_input", 4096, nullptr, 4, nullptr, 0);
 }

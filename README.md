@@ -24,8 +24,27 @@ The `sdprobe` environment provides an SD card diagnostic build.
 See [HARDWARE-NOTES.md](HARDWARE-NOTES.md) for board details and SD card findings.
 The locally collected K10 schematic is in `docs/UnihikerK10Schematic.pdf`.
 
-The `game_controller` folder is excluded while its implementation is being
-replaced. The current firmware input code is in `src/k10_input.cpp`.
+The optional I2C game controller is auto-detected at address `0x5A` on the
+K10's shared I2C bus (SDA GPIO47, SCL GPIO48). It can be connected or removed
+while Doom is running; unplugging it releases its held keys. Set
+`-DK10_GAME_CONTROLLER=0` in `platformio.ini` to compile without its support.
+The driver lives in `lib/GameController`; Doom mappings are in `src/k10_input.cpp`.
+
+| Controller | Doom action |
+| --- | --- |
+| Joystick up/down | Move forward/back; navigate menus |
+| Joystick left/right | Turn left/right; navigate menus |
+| A | Menu/back (Escape) |
+| B | Use/open doors |
+| C | Fire |
+| D | Automap (Tab) |
+| OK | Menu select (Enter) |
+
+Serial keyboard controls remain available: WASD or arrow keys for movement,
+`,`/`.` for strafing, F to fire, Space to use, Enter to select, Escape for the
+menu, Tab for the automap, and 1–9 for weapons. Onboard A fires and B uses;
+BOOT toggles the automap until audio takes over GPIO0. Send `/` over serial
+for button/controller status, or `=` to toggle key-event logging.
 
 The vendored doomgeneric source and its license are in `lib/doomgeneric`.
 Vendor framework and documentation are pinned as Git submodules.
