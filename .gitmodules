@@ -1,6 +1,0 @@
-[submodule "framework-arduinounihiker"]
-	path = framework-arduinounihiker
-	url = https://github.com/DFRobot/framework-arduinounihiker.git
-[submodule "unihiker-docs"]
-	path = unihiker-docs
-	url = https://github.com/UNIHIKER/unihiker-docs.git
